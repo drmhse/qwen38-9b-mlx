@@ -16,3 +16,7 @@ models/Qwen3.8-9B-Abliterated-MLX/4bit/*
 __pycache__/
 *.pyc
 .DS_Store
+
+# dflash runtime: separate venv + 2.6 GB drafter, rebuilt by dflash/setup.sh
+dflash/.venv/
+dflash/draft-9b/

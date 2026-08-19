@@ -14,6 +14,7 @@ measured ceilings — so nobody re-runs the experiments that found them.
                       or model re-download, or prefill silently regresses ~57x
     download.py       re-fetch the 4-bit variant at the pinned revision
     bench_fly.py      re-measure the throughput levers (regression check)
+    dflash/           speculative-decoding runtime (separate venv; see DFlash section)
 
 Untracked, rebuilt locally: `.venv/` (mlx 0.32.0 + mlx-vlm 0.6.8), `models/`
 (5.6 GB, via `download.py`), `.apc-cache/` (self-regenerating). Only the patched
@@ -221,36 +222,113 @@ and Pi is single-stream so the 2.04x concurrency win does not apply. The
 compensation is that Pi grows one conversation — exactly the append-only shape
 exact mode needs, so turn 2 onward prefills in ~0.3s.
 
-## Speculative decoding: the one way past the decode roof
+## Speculative decoding: measured, working, 1.70x
 
-It reduces weight-bytes per accepted token, and is **lossless in output quality**
-regardless of drafter fit — drafts are verified by the target, so a mismatched
-drafter costs speed, never correctness. It is also **decode-only**: MTP, DFlash and
-EAGLE alike do nothing for prefill, which already processes all prompt tokens in
-parallel.
+`dflash-mlx` runs the 9B-native DFlash drafter against this checkpoint and clears
+the 20.8 tok/s decode roof. Measured here, same prompt throughout, 100 tokens out,
+86% draft acceptance:
 
-**Do not try to port a 27B drafter.** Both the 27B MTP head and
-`incoai/Qwen3.8-27B-DFlash2` are shaped to their host's residual stream — the
+| configuration | tok/s | vs baseline | bit-exact vs target |
+|---|---|---|---|
+| target only (mlx_lm, greedy) | 21.4 | 1.00x | reference |
+| DFlash, verify_linear off | **36.4** | **1.70x** | **yes** |
+| DFlash, verify_linear on + qmm on | 42.9 | 2.01x | **no** (rel 4.3e-3) |
+| DFlash, verify_linear on + qmm off | 36.4 | 1.70x | yes |
+
+Peak memory 5.99 GB, against 5.20 GB for the target alone — the drafter adds only
+0.79 GB, because mlx-lm loads lazily and quantizes per tensor, so the 2.6 GB bf16
+copy never exists. Speedup does **not** decay with context here (1.51x at 1865
+prompt tokens vs 1.48x at 23); the published M5 Max curve falls 4.37x -> 2.22x
+because it starts far higher. Target-only measured 20.1-21.4 tok/s and 226.9 tok/s
+prefill under mlx-lm, independently reproducing the roofs above on a second runtime.
+
+**Losslessness was verified, not assumed.** With verify_linear off, DFlash output
+is byte-identical to `mlx_lm generate --temp 0` on the same prompt.
+
+Why it fits: `z-lab/Qwen3.5-9B-DFlash` is hidden 4096 / intermediate 12288 /
+`num_target_layers 32` / vocab 248320, and `fc.weight [4096, 32768]` fuses hidden
+states from 8 target layers `[1,5,9,13,17,21,25,29]`. `bind_target_model` asserts
+no dimensions at all -- it only reads `embed_scale` -- so that concatenation width
+is the entire contract. The drafter ships no `embed_tokens`/`lm_head`, borrowing
+the target's, which means draft logits come out of *this* abliterated head.
+
+### Setup
+
+`dflash/setup.sh` builds a separate 3.13 venv (dflash-mlx depends on **mlx-lm**,
+not mlx-vlm), fetches the drafter, and applies both patches below. It does not
+touch `.venv/` or `serve.sh`. Two fixes are required:
+
+1. **`dflash/shim_draft_config.py`** -- dflash-mlx 0.1.8 reads `rope_theta` and
+   `block_size` from the config root; z-lab publishes them nested
+   (`rope_parameters.rope_theta` per transformers 5.x, `block_size` inside
+   `dflash_config`), so `from_dict` raises `TypeError: missing 2 required
+   positional arguments`. Pure schema drift; the shim lifts both.
+2. **`dflash/patch_dflash_verify_linear.py`** -- optional, see below.
+
+Model loading needed no porting: mlx-lm's `qwen3_5.py` already accepts the VLM
+wrapper (`ModelArgs.from_dict` takes a nested `text_config`, and `sanitize()`
+drops `vision_tower`/`model.visual` and rewrites the `language_model.` prefix),
+and dflash's target adapter is duck-typed -- `"qwen" in model_type` plus a shape
+check -- so it resolves to `qwen_gdn` / `hybrid_gdn` with recurrent rollback.
+
+### verify_linear: an 18% gain that costs bit-exactness
+
+dflash-mlx gates its hand-written Metal verify kernels on
+`_supports_verify_linear`, which for dense models is `num_layers >= 40`. This
+model has 32, so it is excluded on layer count alone -- not on capability: the
+per-linear gate `is_verify_eligible()` accepts **248 of 249** QuantizedLinears
+here (the one rejection is `lm_head`, excluded on purpose by `N < 100_000`), and
+`verify_linear._PROJ_TAGS` carries explicit `gdn_qkv`/`gdn_z`/`gdn_o` tags for
+gated-DeltaNet projections. The threshold is validation policy.
+
+The patch does **not** invent a new threshold. The package already ships
+`DFLASH_VERIFY_LINEAR`, but `loading.py` computes `supports_verify_linear AND
+_verify_enabled_for(...)` and the env var only feeds the right operand, so it
+could disable the feature and never enable it. The patch consults the override at
+the top of `_supports_verify_linear`, and makes `DFLASH_VERIFY_QMM` a tri-state
+(`VerifyConfig.enable_qmm` defaults True with no CLI flag, so the qmm path was
+otherwise unavoidable). Unset, upstream behaviour is unchanged. Both edits are
+idempotent and write `.orig` backups.
+
+**The result is worth knowing before enabling it.** Swapping the 248 linears buys
+*nothing* on its own -- 36.4 tok/s either way. The entire +18% comes from one
+kernel, the M=16 `qmm` path, and that kernel is exactly the one that is not
+bit-exact. Isolated per layer on `mlp.gate_proj`, stock vs `VerifyQuantizedLinear`
+is identical at n=1/8/16 with qmm off, and at n=1/8 with qmm on, diverging **only
+at n=16** -- which is the DFlash block size, so it perturbs the verifier on every
+block (`_build_kernel_m16_super_tree_fp16_ktmpl`: fp16 accumulation).
+
+So it is a speed-for-numerics trade, not free performance. Default is off:
+1.70x while remaining byte-identical to the reference target. Enabling it means
+the verifier is no longer numerically the same model, and "verified by the
+target" stops meaning what it means everywhere else in this file.
+
+    DFLASH_VERIFY_LINEAR=1                    # 2.01x, NOT bit-exact
+    DFLASH_VERIFY_LINEAR=1 DFLASH_VERIFY_QMM=0  # bit-exact, but no gain (36.4)
+
+### Costs of switching runtimes
+
+Not adopted as the default server here, because leaving mlx-vlm costs:
+
+- **No vision tower** -- dflash-mlx builds on mlx-lm; no image input.
+- **No continuous batching**, so the 2.04x concurrency win above disappears.
+  mlx-vlm at 38.2 tok/s aggregate still beats DFlash for concurrent agent traffic;
+  DFlash wins single-stream interactive use.
+- **The two APC fixes do not come along**, so prefill returns to cold cost.
+- **Thinking is on by default** in this runtime, unlike mlx-vlm, so real tasks
+  burn reasoning tokens before answering.
+
+Note the drafter already uses the verify kernels unconditionally at w4
+(`load_draft_bundle` installs them with `enable_qmm=True` regardless of gating).
+That is harmless -- draft errors are corrected by verification. Applying them to
+the *target* is the part that changes the guarantee.
+
+Also still true: **do not try to port a 27B drafter.** Both the 27B MTP head and
+`incoai/Qwen3.8-27B-DFlash2` are shaped to their host's residual stream -- the
 DFlash2 checkpoint is 5120-wide throughout with `fc.weight [5120, 25600]`, fusing
-hidden states tapped from 5 of the 27B's 64 layers (`target_layer_ids
-[5,19,33,47,61]`), and it ships no `embed_tokens`/`lm_head` of its own. Nothing
-lines up with 4096 / 12288 / 32 except the vocab.
-
-**The 9B has native options.** `z-lab/Qwen3.5-9B-DFlash` matches exactly — hidden
-4096, intermediate 12288, `num_target_layers 32`, vocab 248320, `fc.weight
-[4096, 32768]` (8 taps at `[1,5,9,13,17,21,25,29]`), `block_size 16`, 6 layers
-≈ 1.29B params, ~0.7 GB at w4. `bstnxbt/dflash-mlx` supports Qwen3.5 hybrid
-GatedDeltaNet targets and quantizes the draft to w4 by default, reporting 4.37x at
-1k ctx falling to 2.22x at 8k on an M5 Max. `guglxni/Qwen3.5-9B-abliterated-DFlash`
-is an abliterated-tuned variant. The 9B also has its own MTP head in
-`empero-ai/Qwen3.8-9B` (15 tensors, 0.49 GB bf16, fetchable by HTTP range read
-instead of pulling 19.3 GB), which this publisher strips.
-
-Two costs before switching: abliteration re-projected `out_proj`/`down_proj` in
-layers 12–31, so a drafter trained on the un-abliterated stream will accept below
-the published rates; and dflash-mlx is single-request with no continuous batching,
-so it trades the measured 2.04x concurrency win for single-stream latency. Leaving
-mlx-vlm also leaves the caching fixes above. Untested here.
+5 of the 27B's 64 layers, and ships no embeddings of its own. Nothing lines up
+with 4096 / 12288 / 32 except the vocab. The 9B also has its own MTP head in
+`empero-ai/Qwen3.8-9B` (15 tensors, 0.49 GB bf16, fetchable by HTTP range read).
 
 ## Provenance
 
