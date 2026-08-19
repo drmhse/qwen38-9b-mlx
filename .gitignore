@@ -1,0 +1,18 @@
+# Python env — rebuilt by hand; patch_mlx_vlm.py re-applies our fixes into it
+.venv/
+
+# Prompt-cache disk tier: self-regenerating, ~1.1 GB
+.apc-cache/
+
+# 5.6 GB of weights — re-fetch with download.py at the pinned revision.
+# Keep only the one file we patched.
+models/*
+!models/Qwen3.8-9B-Abliterated-MLX/
+models/Qwen3.8-9B-Abliterated-MLX/*
+!models/Qwen3.8-9B-Abliterated-MLX/4bit/
+models/Qwen3.8-9B-Abliterated-MLX/4bit/*
+!models/Qwen3.8-9B-Abliterated-MLX/4bit/chat_template.jinja
+
+__pycache__/
+*.pyc
+.DS_Store
