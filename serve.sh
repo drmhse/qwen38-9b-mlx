@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # OpenAI-compatible server on 127.0.0.1:8080.
+# The model must be named by its literal served path; aliases are rejected.
 #   curl 127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' \
-#     -d '{"model":"local","messages":[{"role":"user","content":"hi"}]}'
+#     -d '{"model":"models/Qwen3.8-9B-Abliterated-MLX/4bit",
+#          "messages":[{"role":"user","content":"hi"}]}'
 set -euo pipefail
 cd "$(dirname "$0")"
 source ./_guard.sh
@@ -17,7 +19,8 @@ export APC_DISK_MAX_GB="${APC_DISK_MAX_GB:-8}"
 # even at 74% free -- that silently disables all warm restores here.
 export APC_DISK_MIN_FREE_RAM_GB="${APC_DISK_MIN_FREE_RAM_GB:-0.5}"
 # In-RAM snapshots are the ONLY place prefix matching happens (disk is exact-key
-# only). Default 2 is enough for one conversation; raise it for concurrent ones.
+# only), so this is the setting that decides whether a warm turn hits at all.
+# Upstream's 2 holds one conversation; 8 leaves room for a few in flight.
 export APC_EXACT_CACHE_ENTRIES="${APC_EXACT_CACHE_ENTRIES:-8}"
 
 exec .venv/bin/python -m mlx_vlm.server \

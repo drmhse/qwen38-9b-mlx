@@ -26,7 +26,7 @@ python3 "$HERE/patch_dflash_verify_linear.py" \
 
 "$VENV/bin/dflash" doctor
 echo
-echo "run:  $VENV/bin/dflash generate \\"
-echo "        --model $HERE/../models/Qwen3.8-9B-Abliterated-MLX/4bit \\"
-echo "        --draft $DRAFT --verify-mode adaptive --draft-quant w4 \\"
-echo "        --max-tokens 100 --prompt '...'"
+echo "run:  $HERE/run.sh 'your prompt'"
+echo
+echo "run.sh wraps the CLI above with the same memory guard serve.sh uses; the"
+echo "raw command is in its header if you need to vary the flags."

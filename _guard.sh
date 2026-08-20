@@ -2,12 +2,14 @@
 # is genuinely low. Uses memory_pressure's system-wide free percentage --
 # vm_stat free+inactive badly understates availability on macOS, because most
 # memory is held as reclaimable file cache / compressed pages.
-_others=$(pgrep -f "mlx_vlm|mistralrs" || true)
+# `bin/dflash` catches the speculative-decoding runtime in dflash/.venv, which holds
+# ~6GB of its own. It is a separate venv, so nothing else here would notice it.
+_others=$(pgrep -f "mlx_vlm|mistralrs|bin/dflash" || true)
 if [ -n "$_others" ]; then
   echo "REFUSING TO START: an inference process is already running:" >&2
   ps -o pid=,rss=,command= -p $(echo "$_others" | tr '\n' ' ') 2>/dev/null \
     | awk '{printf "  pid %s  rss=%.1fGB  %s\n", $1, $2/1048576, $3}' >&2
-  echo "Stop it first:  pkill -f mlx_vlm" >&2
+  echo "Stop it first:  pkill -f mlx_vlm   (or pkill -f bin/dflash)" >&2
   exit 1
 fi
 _total_gb=$(( $(sysctl -n hw.memsize) / 1073741824 ))

@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""Measure the three levers that actually matter for mlx-vlm throughput.
+"""Measure the three server-side levers for mlx-vlm throughput.
 
-Single-stream decode is pinned at the memory-bandwidth roof (~21 tok/s), so the
-wins are elsewhere: not emitting tokens you don't need (thinking), not
-recomputing prefill (prompt cache), and amortizing weight reads across
-concurrent requests (continuous batching).
+Single-stream decode under this server is pinned at the memory-bandwidth roof
+(~21 tok/s), so the wins here are elsewhere: not emitting tokens you don't need
+(thinking), not recomputing prefill (prompt cache), and amortizing weight reads
+across concurrent requests (continuous batching).
+
+That roof is a property of one-token-at-a-time decoding, not of the hardware
+budget. Speculative decoding clears it at 36.4 tok/s by verifying a drafted
+block per weight read -- but it runs under mlx-lm in dflash/.venv with no server
+to talk to, so it is measured by `dflash generate` and not by this script. See
+the DFlash section of README.md.
 """
 import json, sys, threading, time, urllib.request
 
